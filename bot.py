@@ -15,7 +15,8 @@ Updates Discord voice channel names with live player counts from WordPress
 
 # Discord Configuration
 TOKEN = os.getenv('DISCORD_BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
-CHANNEL_ID = int(os.getenv('CHANNEL_ID', '0'))  # Voice channel ID to update
+PLAYER_CHANNEL_ID = int(os.getenv('PLAYER_CHANNEL_ID', '0'))  # Voice channel ID for player count
+LAST_PLAYER_CHANNEL_ID = int(os.getenv('LAST_PLAYER_CHANNEL_ID', '0'))  # Voice channel ID for last player (optional)
 
 # WordPress API Configuration
 WORDPRESS_API_URL = os.getenv('WORDPRESS_API_URL', 'https://yoursite.com/wp-json/discord-bot/v1/stats/Main-Server')
@@ -29,6 +30,7 @@ HOT_THRESHOLD = int(os.getenv('HOT_THRESHOLD', '24'))  # Players count for 🔥 
 # Channel Name Format
 # Available variables: {emoji}, {current}, {max}, {status}
 CHANNEL_NAME_FORMAT = os.getenv('CHANNEL_NAME_FORMAT', '{emoji} Players: {current}/{max}')
+LAST_PLAYER_FORMAT = os.getenv('LAST_PLAYER_FORMAT', '👤 Last: {player}')
 
 # ============================================================================
 # BOT INITIALIZATION
@@ -39,6 +41,7 @@ client = discord.Client(intents=intents)
 
 # Global variables for tracking
 last_player_count = -1
+last_player_name = None
 last_update_time = None
 consecutive_errors = 0
 MAX_CONSECUTIVE_ERRORS = 5
@@ -54,7 +57,9 @@ async def on_ready():
     print('Discord Player Count Bot - CONNECTED')
     print('=' * 60)
     print(f'✅ Bot logged in as: {client.user}')
-    print(f'📊 Monitoring channel ID: {CHANNEL_ID}')
+    print(f'📊 Player count channel ID: {PLAYER_CHANNEL_ID}')
+    if LAST_PLAYER_CHANNEL_ID > 0:
+        print(f'👤 Last player channel ID: {LAST_PLAYER_CHANNEL_ID}')
     print(f'🌐 WordPress API: {WORDPRESS_API_URL}')
     print(f'⏰ Update interval: {UPDATE_INTERVAL} minutes')
     print(f'🔥 Hot threshold: {HOT_THRESHOLD}/{MAX_PLAYERS} players')
@@ -85,15 +90,21 @@ async def update_channel():
 
 async def update_channel_once():
     """Single update execution"""
-    global last_player_count, last_update_time, consecutive_errors
+    global last_player_count, last_player_name, last_update_time, consecutive_errors
     
     try:
-        # Get the Discord channel
-        channel = client.get_channel(CHANNEL_ID)
-        if not channel:
-            print(f'❌ Error: Could not find channel with ID {CHANNEL_ID}')
+        # Get the Discord channels
+        player_channel = client.get_channel(PLAYER_CHANNEL_ID)
+        if not player_channel:
+            print(f'❌ Error: Could not find player channel with ID {PLAYER_CHANNEL_ID}')
             print(f'   Make sure the channel ID is correct and the bot has access')
             return
+        
+        last_player_channel = None
+        if LAST_PLAYER_CHANNEL_ID > 0:
+            last_player_channel = client.get_channel(LAST_PLAYER_CHANNEL_ID)
+            if not last_player_channel:
+                print(f'⚠️  Warning: Could not find last player channel with ID {LAST_PLAYER_CHANNEL_ID}')
         
         # Fetch player data from WordPress
         player_data = get_player_data_from_wordpress()
@@ -108,7 +119,8 @@ async def update_channel_once():
                     player_data = {
                         'current_players': last_player_count,
                         'max_players': MAX_PLAYERS,
-                        'server_status': 'unknown'
+                        'server_status': 'unknown',
+                        'last_player': last_player_name
                     }
                 else:
                     return
@@ -120,11 +132,12 @@ async def update_channel_once():
         current_players = player_data['current_players']
         max_players = player_data.get('max_players', MAX_PLAYERS)
         server_status = player_data.get('server_status', 'online')
+        new_last_player = player_data.get('last_player')
         
         # Determine emoji based on player count and status
         emoji = get_status_emoji(current_players, max_players, server_status)
         
-        # Format channel name
+        # Format player count channel name
         new_name = CHANNEL_NAME_FORMAT.format(
             emoji=emoji,
             current=current_players,
@@ -132,16 +145,27 @@ async def update_channel_once():
             status=server_status
         )
         
-        # Only update if name changed (to avoid unnecessary API calls)
-        if channel.name != new_name:
-            await channel.edit(name=new_name)
-            print(f'✅ Updated channel to: {new_name}')
+        # Update player count channel (only if name changed)
+        if player_channel.name != new_name:
+            await player_channel.edit(name=new_name)
+            print(f'✅ Updated player channel to: {new_name}')
             print(f'   Time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
         else:
             print(f'ℹ️  No change needed (still: {new_name})')
         
+        # Update last player channel if configured and data available
+        if last_player_channel and new_last_player:
+            last_player_channel_name = LAST_PLAYER_FORMAT.format(player=new_last_player)
+            
+            if last_player_channel.name != last_player_channel_name:
+                await last_player_channel.edit(name=last_player_channel_name)
+                print(f'✅ Updated last player channel to: {last_player_channel_name}')
+            else:
+                print(f'ℹ️  Last player unchanged (still: {last_player_channel_name})')
+        
         # Update tracking variables
         last_player_count = current_players
+        last_player_name = new_last_player
         last_update_time = datetime.now()
         
     except discord.errors.Forbidden:
@@ -166,7 +190,7 @@ def get_player_data_from_wordpress():
     Fetch player count data from WordPress REST API
     
     Returns:
-        dict: Player data with keys: current_players, max_players, server_status
+        dict: Player data with keys: current_players, max_players, server_status, last_player
         None: If request fails
     """
     try:
@@ -188,10 +212,15 @@ def get_player_data_from_wordpress():
             player_data = {
                 'current_players': int(data.get('current_players', 0)),
                 'max_players': int(data.get('max_players', MAX_PLAYERS)),
-                'server_status': data.get('server_status', 'online')
+                'server_status': data.get('server_status', 'online'),
+                'last_player': data.get('last_player')  # NEW: Get last player name
             }
             
-            print(f'✅ API Success: {player_data["current_players"]}/{player_data["max_players"]} players')
+            log_msg = f'✅ API Success: {player_data["current_players"]}/{player_data["max_players"]} players'
+            if player_data['last_player']:
+                log_msg += f', last: {player_data["last_player"]}'
+            print(log_msg)
+            
             return player_data
             
         elif response.status_code == 404:
@@ -229,7 +258,8 @@ def get_player_data_fallback():
     return {
         'current_players': 0,
         'max_players': MAX_PLAYERS,
-        'server_status': 'unknown'
+        'server_status': 'unknown',
+        'last_player': None
     }
 
 # ============================================================================
@@ -269,8 +299,8 @@ def validate_configuration():
     if TOKEN == 'YOUR_BOT_TOKEN_HERE' or not TOKEN:
         errors.append('Discord bot token not configured')
     
-    if CHANNEL_ID == 0:
-        errors.append('Channel ID not configured')
+    if PLAYER_CHANNEL_ID == 0:
+        errors.append('Player channel ID not configured')
     
     if WORDPRESS_API_URL == 'https://yoursite.com/wp-json/discord-bot/v1/stats/Main-Server':
         errors.append('WordPress API URL not configured')
@@ -287,7 +317,8 @@ def validate_configuration():
         print('1. Editing the configuration values at the top of bot.py')
         print('2. Setting environment variables:')
         print('   - DISCORD_BOT_TOKEN')
-        print('   - CHANNEL_ID')
+        print('   - PLAYER_CHANNEL_ID')
+        print('   - LAST_PLAYER_CHANNEL_ID (optional)')
         print('   - WORDPRESS_API_URL')
         print('=' * 60)
         return False
